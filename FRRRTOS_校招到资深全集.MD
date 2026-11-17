@@ -10,21 +10,31 @@
    面向 MCU 的轻量实时内核；多任务抢占、队列/信号量/互斥量、延时管理；比裸机实时性好、比 Linux 小且确定性强。
 
 2. **任务四种状态**
-   Ready / Running / Blocked（等延时、等队列、等信号量）/ Suspended（vTaskSuspend 挂起）。单核同时只有一个 Running。
+   Ready / Running / Blocked（等延时、等队列、等信号量、等事件组、等任务通知）/ Suspended（vTaskSuspend 挂起）。单核同时只有一个 Running。
 
 3. **调度策略**
-   默认优先级抢占（数值越大越高，0 是空闲任务）；同优先级开 configUSE_TIME_SLICING 才时间片轮转；高优先级就绪立即抢占。
+   默认优先级抢占（数值越大逻辑优先级越高，最高为 configMAX_PRIORITIES-1；0 即 tskIDLE_PRIORITY，是空闲任务所在优先级，用户任务也可以用 0）；同优先级需 configUSE_TIME_SLICING=1 才时间片轮转，**该宏默认就是 1（开启）**，轮转粒度为 1 个 tick；高优先级就绪立即抢占。
 
 4. **vTaskDelay vs vTaskDelayUntil**
-   vTaskDelay(n)：相对延时，从调用起睡 n tick，周期漂移；
-   vTaskDelayUntil(&last, n)：绝对延时，按上次唤醒对齐，适合周期采样。
+   vTaskDelay(n)：相对延时，从调用起睡 n tick，周期漂移；vTaskDelay(0) 等价于 taskYIELD()；
+   vTaskDelayUntil(&last, n)：绝对延时，按上次唤醒时刻对齐，适合周期采样；**V10.4 起推荐用带返回值的 xTaskDelayUntil()**，首次使用前 last 必须初始化为 xTaskGetTickCount()。
 
 5. **队列干什么**
    任务间/中断与任务间传数据，值拷贝、FIFO、可超时；满/空则阻塞。传数据首选队列。
 
 6. **二值信号量 vs 互斥量（必背）**
-   二值信号量：同步、无所有权、无优先级继承、不在 ISR Take；
-   互斥量：保护共享资源、谁 Take 谁 Give、带优先级继承、不能在 ISR 用。
+   二值信号量：同步（中断/任务 → 任务）、无所有权、无优先级继承，工程上只在 ISR 里 Give；
+   互斥量：保护共享资源、谁 Take 谁 Give、带优先级继承、**中断里既不能 Take 也不能 Give**。
+   > 严格说 API 层存在 xSemaphoreTakeFromISR()（不带阻塞时间，仅用于二值/计数信号量，禁止用于互斥量），但典型用法仍是「ISR Give、任务 Take」。
+
+对比项	二值信号量	互斥信号量 (Mutex)
+用途	事件同步、通知	资源互斥保护
+初始值	一般初始为 0（无事件）；也可初始 1	固定初始为 1（空闲，可用）
+释放者	获取和释放可以是不同任务 / 中断	必须由持有锁的任务自己释放
+优先级继承	❌ 无，会发生优先级反转	✅ 支持优先级继承
+能不能在中断里释放	✅ 可以用xSemaphoreGiveFromISR	❌ 禁止在中断中使用 Mutex（不能用 GiveFromISR）
+递归获取（嵌套拿锁）	❌ 不支持，拿两次直接卡死	❌ 普通 Mutex 也不支持；递归互斥锁 RecursiveMutex 才支持
+所有权	无所有权概念	有所有权，记录哪个任务持有
 
 7. **优先级反转是什么 / 怎么解**
    低 L 拿锁→高 H 等锁→中 M 抢 L 的 CPU→H 被 M 间接阻塞；
@@ -41,20 +51,25 @@
    开 configCHECK_FOR_STACK_OVERFLOW；溢出典型表现 HardFault / 跑飞。
 
 10. **heap_1~5 一句话**
-    heap_4 最常用（最佳匹配+合并相邻空闲块）；heap_1 只分配不释放；heap_3 简单封装标准库malloc/free；**heap_1/2/4/5禁止混用裸机malloc与pvPortMalloc，heap_3二者等价**。
+    heap_1：只分配不释放，最简单、最确定，适合任务全静态创建、永不删除的安全场景；
+    heap_2：**最佳匹配（best fit）、不合并相邻空闲块**，易碎片，已废弃不建议新项目用；
+    heap_3：简单封装标准库 malloc/free，仅加了挂起调度器保证线程安全，堆大小由链接脚本决定；
+    heap_4：**首次适配（first fit）+ 合并相邻空闲块**，抗碎片，最常用；
+    heap_5：算法与 heap_4 相同，但支持多块不连续 RAM 区域，**使用前必须先调用 vPortDefineHeapRegions()**；
+    heap_1/2/4/5 的堆是内核自己的 ucHeap 数组，与标准库 malloc 的堆是两套内存，混用会白占 RAM，且标准库 malloc 默认不是线程安全的，因此工程上统一只用 pvPortMalloc；heap_3 下 pvPortMalloc 本身就是 malloc 的包装，二者等价。
 
 > ✨【新增基础拓展5题，面试高频】
 11. **空闲任务是什么，作用？**
     优先级固定0，调度器启动自动创建，永远不会阻塞；系统无就绪任务时运行；负责回收被vTaskDelete删除任务的内核TCB与栈内存；可开启Idle Hook；**禁止在空闲任务Hook调用会阻塞的API；禁止在Idle Hook喂硬件看门狗**。
 
 12. **任务为什么不能return？**
-    任务函数是死循环；如果return，会进入`pxTaskExitError`，触发断言/HardFault；只执行一次的任务要在末尾调用`vTaskDelete(NULL)`。
+    任务函数必须是死循环；如果 return，会跳到移植层初始化在 LR 里的`prvTaskExitError()`，触发断言/进 HardFault 死循环；只执行一次的任务要在末尾调用`vTaskDelete(NULL)`。
 
 13. **什么是任务饿死(Starvation)？如何避免**
     高优先级任务持续就绪不阻塞，低优先级永远得不到CPU时间；避免：高优先级任务必须设置阻塞点(delay/等IPC)，合理分配优先级，避免任务长期处于就绪态。
 
 14. **递归互斥量什么时候用，和普通互斥区别**
-    普通互斥同一任务重复Take直接死锁；递归互斥支持同一任务多次Take，内部计数，Take N次必须Give N次才释放；适合函数嵌套、库函数内部加锁场景；**不能在中断使用，不能混用普通Take/Give**。
+    普通互斥同一任务重复Take会自己等自己，直接死锁（超时版本则Take失败）；递归互斥支持同一任务多次Take，内部计数，Take N次必须Give N次才真正释放；同样支持优先级继承；适合函数嵌套、库函数内部加锁场景；**必须用xSemaphoreCreateRecursiveMutex创建、配套xSemaphoreTakeRecursive/GiveRecursive，不能在中断使用，不能混用普通Take/Give**。
 
 15. **计数信号量典型场景**
     资源池、缓冲区计数、事件计数；初值代表可用资源总数；生产者Give，消费者Take。
